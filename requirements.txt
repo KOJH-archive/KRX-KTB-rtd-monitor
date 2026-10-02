@@ -1,0 +1,2 @@
+xlwings>=0.32,<0.34
+pywin32>=306; platform_system == "Windows"
