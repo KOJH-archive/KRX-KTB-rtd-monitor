@@ -3,7 +3,15 @@ import csv, tkinter as tk
 from pathlib import Path
 from analyze_snapshots import analyze, read_rows
 
-CSV = Path(__file__).parent / "data" / "snapshots.csv"
+DATA_DIR = Path(__file__).parent / "data"
+
+def current_csv() -> Path:
+    """Use the live trade-price log when it exists, otherwise the legacy log."""
+    trade_csv = DATA_DIR / "snapshots_with_trades.csv"
+    legacy_csv = DATA_DIR / "snapshots.csv"
+    if trade_csv.exists() and trade_csv.stat().st_size > 0:
+        return trade_csv
+    return legacy_csv
 
 class Dashboard(tk.Tk):
     def __init__(self):
@@ -24,14 +32,15 @@ class Dashboard(tk.Tk):
         self.after(500, self.refresh)
     def refresh(self):
         try:
-            with CSV.open("r", newline="", encoding="utf-8") as f: rows=list(csv.DictReader(f))
+            csv_path = current_csv()
+            with csv_path.open("r", newline="", encoding="utf-8") as f: rows=list(csv.DictReader(f))
             if rows:
-                row=rows[-1]; self.status.config(text=f"UTC {row['timestamp_utc']}   |   source: snapshots.csv")
+                row=rows[-1]; self.status.config(text=f"UTC {row['timestamp_utc']}   |   source: {csv_path.name}")
                 for name in ("3y","10y"):
                     for key in ("mid","spread","obi","weighted_obi","microprice","bid_depth","ask_depth"):
                         value=float(row[f"{name}_{key}"]); text=f"{value:.4f}" if key in ("mid","microprice") else (f"{value:+.3f}" if "obi" in key else f"{value:.3f}")
                         self.labels[(name,key)].config(text=text)
-                result = analyze(read_rows(CSV), window=120, beta=2.88)
+                result = analyze(read_rows(csv_path), window=120, beta=2.88, min_samples=20)
                 if result:
                     z = float(result["zscore"])
                     candidate = "10Y 상대강세" if z >= 2 else ("10Y 상대약세" if z <= -2 else None)
@@ -45,7 +54,10 @@ class Dashboard(tk.Tk):
                         if self.rv_count >= 3:
                             self.rv_state = candidate or "중립/관찰"; self.rv_candidate, self.rv_count = None, 0
                     state = self.rv_state
-                    self.rv.config(text=f"RV Δ {float(result['latest_rv_change']):+.6f}  |  평균 {float(result['window_mean']):+.6f}  |  표준편차 {float(result['window_stdev']):.6f}  |  z-score {z:+.3f}  |  해석: {state}")
+                    sample_count = int(result["samples"])
+                    if sample_count < 20:
+                        state = f"데이터 축적 중 ({sample_count}/20 이벤트)"
+                    self.rv.config(text=f"RV level {float(result['latest_rv_level']):+.4f}  |  평균 {float(result['level_mean']):+.4f}  |  z-score {z:+.3f}  |  해석: {state}")
                 else:
                     self.rv.config(text="RV: 유효한 가격 변화가 쌓이는 중입니다 (최소 2개 스냅샷 필요)")
         except (FileNotFoundError, PermissionError, KeyError, ValueError): pass

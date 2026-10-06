@@ -12,7 +12,7 @@ if not exist ".venv32\Scripts\python.exe" (
     exit /b 1
 )
 
-if not exist "???? ???.xlsx" (
+if not exist "*.xlsx" (
     echo Workbook was not found in this folder.
     pause
     exit /b 1

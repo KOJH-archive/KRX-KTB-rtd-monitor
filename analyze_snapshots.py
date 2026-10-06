@@ -11,21 +11,37 @@ def read_rows(path: Path) -> list[dict[str, object]]:
             except (TypeError, ValueError): pass
         return rows
 
-def analyze(rows: list[dict[str, object]], window: int, beta: float) -> dict[str, object] | None:
-    changes, previous = [], None
+def analyze(rows: list[dict[str, object]], window: int, beta: float, min_samples: int = 20) -> dict[str, object] | None:
+    changes, levels, previous = [], [], None
     for row in rows:
-        mid3 = row.get("3y_trade_price", row.get("3y_mid"))
-        mid10 = row.get("10y_trade_price", row.get("10y_mid"))
+        # Use executable-book mids for the RV level; last trade is a confirmation field.
+        mid3 = row.get("3y_mid", row.get("3y_trade_price"))
+        mid10 = row.get("10y_mid", row.get("10y_trade_price"))
         if not isinstance(mid3, float) or not isinstance(mid10, float): continue
-        if previous is not None and (mid3, mid10) != previous:
-            changes.append((mid10 - previous[1]) - beta * (mid3 - previous[0]))
+        level = mid10 - beta * mid3
+        if previous is None:
+            levels.append(level)
+        elif (mid3, mid10) != previous:
+            changes.append(level - (previous[1] - beta * previous[0]))
+            levels.append(level)
         previous = (mid3, mid10)
-    if not changes: return None
-    sample, latest = changes[-window:], changes[-1]
-    mean = statistics.fmean(sample)
-    stdev = statistics.stdev(sample) if len(sample) >= 2 else 0.0
-    return {"timestamp_utc": rows[-1]["timestamp_utc"], "samples": len(changes), "latest_rv_change": latest,
-            "window_mean": mean, "window_stdev": stdev, "zscore": (latest-mean)/stdev if stdev > 1e-12 else 0.0, "beta": beta}
+    if not levels: return None
+    level_sample = levels[-window:]
+    latest_level = level_sample[-1]
+    level_mean = statistics.fmean(level_sample)
+    level_stdev = statistics.stdev(level_sample) if len(level_sample) >= 2 else 0.0
+    change_sample, latest_change = changes[-window:], (changes[-1] if changes else 0.0)
+    change_mean = statistics.fmean(change_sample) if change_sample else 0.0
+    change_stdev = statistics.stdev(change_sample) if len(change_sample) >= 2 else 0.0
+    level_zscore = ((latest_level - level_mean) / level_stdev
+                    if len(level_sample) >= min_samples and level_stdev > 1e-12 else 0.0)
+    change_zscore = ((latest_change - change_mean) / change_stdev
+                     if len(change_sample) >= 2 and change_stdev > 1e-12 else 0.0)
+    return {"timestamp_utc": rows[-1]["timestamp_utc"], "samples": len(changes),
+            "latest_rv_level": latest_level, "level_mean": level_mean, "level_stdev": level_stdev,
+            "latest_rv_change": latest_change, "window_mean": change_mean, "window_stdev": change_stdev,
+            "zscore": level_zscore, "level_zscore": level_zscore, "change_zscore": change_zscore,
+            "beta": beta}
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Summarize KTB 3Y/10Y relative-value changes.")
@@ -36,7 +52,8 @@ def main() -> int:
     if result is None: print("분석할 유효한 스냅샷이 없습니다."); return 1
     print(f"KTB RV summary | {result['timestamp_utc']}")
     print(f"samples {int(result['samples'])} | beta {result['beta']:.4f} | window {a.window}")
-    print(f"latest RV change {result['latest_rv_change']:+.6f} | mean {result['window_mean']:+.6f} | stdev {result['window_stdev']:.6f} | z-score {result['zscore']:+.3f}")
+    print(f"RV level {result['latest_rv_level']:+.6f} | level mean {result['level_mean']:+.6f} | level stdev {result['level_stdev']:.6f} | level z-score {result['level_zscore']:+.3f}")
+    print(f"latest RV change {result['latest_rv_change']:+.6f} | change z-score {result['change_zscore']:+.3f}")
     return 0
 
 if __name__ == "__main__": raise SystemExit(main())

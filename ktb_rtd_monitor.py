@@ -42,7 +42,7 @@ LAYOUTS = (
 )
 
 
-def _numbers(values: Iterable[object], label: str) -> list[float]:
+def _numbers(values: Iterable[object], label: str, expected_len: int = 5) -> list[float]:
     result: list[float] = []
     for value in values:
         value = value[0] if isinstance(value, list) and len(value) == 1 else value
@@ -55,8 +55,8 @@ def _numbers(values: Iterable[object], label: str) -> list[float]:
         if number <= 0:
             raise FeedUnavailable(f"{label}: non-positive value {number}")
         result.append(number)
-    if len(result) != 5:
-        raise FeedUnavailable(f"{label}: expected five levels, received {len(result)}")
+    if len(result) != expected_len:
+        raise FeedUnavailable(f"{label}: expected {expected_len} levels, received {len(result)}")
     return result
 
 
@@ -116,7 +116,7 @@ class ExcelRtdReader:
             self._sheet = self._sheet or self._connect()
             row: dict[str, object] = {"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
             for layout in LAYOUTS:
-                row[f"{layout.name.lower()}_trade_price"] = _numbers([self._sheet.range(layout.trade_price).value], f"{layout.name} trade price")[0]
+                row[f"{layout.name.lower()}_trade_price"] = _numbers([self._sheet.range(layout.trade_price).value], f"{layout.name} trade price", expected_len=1)[0]
                 row.update(_metrics(layout.name.lower(), _column(self._sheet, layout.bid_prices, f"{layout.name} bid prices"),
                                     _column(self._sheet, layout.bid_qty, f"{layout.name} bid quantities"),
                                     _column(self._sheet, layout.ask_prices, f"{layout.name} ask prices"),
@@ -133,13 +133,15 @@ class SnapshotLogger:
     def __init__(self, output_dir: Path, csv_enabled: bool, sqlite_enabled: bool) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = output_dir / "snapshots.csv"
+        db_name = "snapshots.sqlite"
         if self.csv_path.exists() and self.csv_path.stat().st_size > 0:
             first_line = self.csv_path.open("r", encoding="utf-8").readline()
             if "3y_trade_price" not in first_line:
                 self.csv_path = output_dir / "snapshots_with_trades.csv"
+                db_name = "snapshots_with_trades.sqlite"
         self.csv_enabled, self.sqlite_enabled = csv_enabled, sqlite_enabled
         self._header_written = self.csv_path.exists() and self.csv_path.stat().st_size > 0
-        self.db = sqlite3.connect(output_dir / "snapshots.sqlite") if sqlite_enabled else None
+        self.db = sqlite3.connect(output_dir / db_name) if sqlite_enabled else None
 
     def write(self, row: dict[str, object]) -> None:
         if self.csv_enabled:
@@ -168,28 +170,30 @@ class RollingRV:
         self.window, self.beta = window, beta
         self.previous: tuple[float, float] | None = None
         self.changes: list[float] = []
+        self.levels: list[float] = []
 
-    def update(self, row: dict[str, object]) -> tuple[float, float, float] | None:
-        trade_keys = ("3y_trade_price", "10y_trade_price")
-        use_trade = all(key in row and float(row[key]) > 0 for key in trade_keys)
-        current = ((float(row[trade_keys[0]]) if use_trade else float(row["3y_mid"])),
-                   (float(row[trade_keys[1]]) if use_trade else float(row["10y_mid"])))
+    def update(self, row: dict[str, object]) -> tuple[float, float, float, int] | None:
+        current = (float(row["3y_mid"]), float(row["10y_mid"]))
+        level = current[1] - self.beta * current[0]
         if self.previous is None:
             self.previous = current
+            self.levels.append(level)
             return None
         if current == self.previous:
             return None
         change = (current[1] - self.previous[1]) - self.beta * (current[0] - self.previous[0])
         self.previous = current
         self.changes.append(change)
-        sample = self.changes[-self.window:]
+        self.levels.append(level)
+        sample = self.levels[-self.window:]
         mean = statistics.fmean(sample)
         stdev = statistics.stdev(sample) if len(sample) >= 2 else 0.0
-        zscore = (change - mean) / stdev if stdev > 1e-12 else 0.0
-        return change, mean, zscore
+        zscore = ((level - mean) / stdev
+                  if len(sample) >= 20 and stdev > 1e-12 else 0.0)
+        return change, mean, zscore, len(sample)
 
 
-def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, float] | None = None,
+def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, float, int] | None = None,
             clear_screen: bool = True) -> None:
     if clear_screen:
         print("\033[2J\033[H", end="")
@@ -200,7 +204,7 @@ def display(row: dict[str, object], interval_ms: int, rv: tuple[float, float, fl
         print(f"     OBI {row[name+'_obi']:+.3f}  WOBI {row[name+'_weighted_obi']:+.3f}  "
               f"micro {row[name+'_microprice']:.4f}  depth B/A {row[name+'_bid_depth']:.0f}/{row[name+'_ask_depth']:.0f}")
     if rv is not None:
-        print(f"RV Δ(10Y-{2.88:.2f}×3Y) {rv[0]:+.6f}  mean {rv[1]:+.6f}  z-score {rv[2]:+.3f}")
+        print(f"RV level z-score {rv[2]:+.3f}  |  samples {rv[3]}/20  |  latest Δ {rv[0]:+.6f}")
     else:
         print("RV warming up (waiting for a second snapshot)")
     print("Ctrl+C to stop. Data collection only; no order functionality is present.")
